@@ -227,7 +227,7 @@ def thread_infer(model_path, queue_input, queue_output):
     # Get input and output details
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
-    print(input_details, output_details)
+    #print(input_details, output_details)
 
     # Prepare the input data
     # Replace `your_input_data` with the actual input data, ensuring it matches the model's expected format and dimensions
