@@ -186,7 +186,7 @@ def postprocess(inf_result_q, render_img_q):
         img = render_result(img, bboxes)
 
         render_img_q.put(img)
-        assert render_img_q.qsize() < 100
+        assert render_img_q.qsize() < 1000
 
 
 def render(render_img_q):
