@@ -60,7 +60,7 @@ class Ordered_Queue:
         self.lock.release()
         assert len(self.data) == len(self.indices)
 
-    def get(self, wait_flag:bool=True, timeout:int=-1):
+    def get(self, block:bool=True, timeout:int=-1):
         entry_time = time.time()
         while True:
             self.lock.acquire()
@@ -75,7 +75,7 @@ class Ordered_Queue:
                     assert len(self.data) == len(self.indices)
                     return data
             self.lock.release()
-            if wait_flag == False:
+            if block == False:
                 return None
             if timeout != -1 and entry_time - time.time() > timeout:
                 return None

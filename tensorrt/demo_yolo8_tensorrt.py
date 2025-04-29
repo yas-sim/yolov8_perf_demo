@@ -2,6 +2,7 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 
+from functools import reduce
 import time
 import cv2
 import numpy as np
@@ -13,11 +14,10 @@ import queue
 
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 
-fps = 0
-abort_flag = False
+g_fps = 0
+g_abort_flag = False
 
-#ENGINE_PATH = './yolov8s_b32_fp16.engine'
-ENGINE_PATH = './yolov8s_b32_int8.engine'
+ENGINE_PATHS = [ 'yolov8s_b1_int8.engine', 'yolov8s_b32_int8.engine' ]
 
 MOVIE_FILE = '../data/people.mp4'
 
@@ -95,7 +95,9 @@ def put_text_with_fringe(img, text, origin, color=(0, 255, 0), scale=1.0, thickn
 
 
 def render_result(img, bboxes):
-    global fps
+    global g_fps
+    global g_engine_path
+
     result_image = img
     for bbox in bboxes:
         x0, y0, x1, y1 = [ int(coord) for coord in bbox['box']]
@@ -113,17 +115,45 @@ def render_result(img, bboxes):
         cv2.rectangle(result_image, (lx0, ly0), (lx1, ly1), color, -1)
         cv2.putText(result_image, text, (lx0, ly0), cv2.FONT_HERSHEY_PLAIN, 1, (0, 0, 0), 1)
 
-    text = f'GPU {fps:7.2f} FPS'
+    text = f'GPU {g_fps:7.2f} FPS'
     result_image = put_text_with_fringe(result_image, text, (0, 0), (0, 255, 0), 4, 6)
-    _, text = os.path.split(ENGINE_PATH)
+    _, text = os.path.split(g_engine_path)
     result_image = put_text_with_fringe(result_image, text, (0, 600), (0, 255, 0), 2, 4)
     return result_image
 
 
-def capt(capt_img_q):
-    global abort_flag
+def capt(capt_img_q):       # Pre-decode version
+    global g_abort_flag
     cap = None
-    while abort_flag == False:
+    images = []
+    cap = cv2.VideoCapture(MOVIE_FILE)
+    print('Reading frames')
+    while True:             # Decode the movie in advance
+        sts, img = cap.read()
+        if sts == False or img is None:
+            break
+        img = cv2.resize(img, (640, 640))
+        tensor = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        tensor = np.transpose(tensor, (2, 0, 1)).astype(np.float32)
+        tensor /= 255.0
+        images.append((img, tensor))
+    cap.release()
+    print(f'{len(images)} frames are read.')      
+
+    while True:
+        for image, tensor in images:
+            if g_abort_flag == True:
+                return
+            while capt_img_q.qsize() > 10:
+                time.sleep(1e-3)
+            capt_img_q.put((image.copy(), tensor))
+            assert capt_img_q.qsize() < 100
+
+
+def capt_(capt_img_q):      # real-time decode version
+    global g_abort_flag
+    cap = None
+    while g_abort_flag == False:
         if cap is None:
             cap = cv2.VideoCapture(MOVIE_FILE)
         sts, img = cap.read()
@@ -131,7 +161,7 @@ def capt(capt_img_q):
             cap.release()
             cap = None
             continue
-        while capt_img_q.qsize() > 5 and abort_flag == False:
+        while capt_img_q.qsize() > 5 and g_abort_flag == False:
             time.sleep(1e-3)
         img = cv2.resize(img, (640, 640))
         tensor = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -140,14 +170,13 @@ def capt(capt_img_q):
 
         while capt_img_q.qsize() > 10:
             time.sleep(10e-3)
-        assert capt_img_q.qsize() < 10
         capt_img_q.put((img, tensor))
-
+        assert capt_img_q.qsize() < 100
 
 
 def postprocess(inf_result_q, render_img_q):
-    global abort_flag
-    while abort_flag == False:
+    global g_abort_flag
+    while g_abort_flag == False:
         try:
             res, img = inf_result_q.get(block=True, timeout=10e-3)
         except queue.Empty:
@@ -156,18 +185,16 @@ def postprocess(inf_result_q, render_img_q):
         bboxes = postprocess_yolov8(res)
         img = render_result(img, bboxes)
 
-        if render_img_q.qsize() > 5:
-            continue        # drop the result
-        assert render_img_q.qsize() < 10
         render_img_q.put(img)
+        assert render_img_q.qsize() < 100
 
 
 def render(render_img_q):
-    global abort_flag
+    global g_abort_flag
     last_time_render = time.perf_counter()
-    while abort_flag == False:
+    while g_abort_flag == False:
         try:
-            img = render_img_q.get(block=True, timeout=10e-3)
+            img = render_img_q.get(block=True, timeout=1e-3)
         except queue.Empty:
             continue
         curr_time = time.perf_counter()
@@ -176,10 +203,9 @@ def render(render_img_q):
             cv2.imshow('Result', img)
             key = cv2.waitKey(1)
             if key == 27:
-                abort_flag = True
+                g_abort_flag = True
     cv2.destroyAllWindows()
 
-from functools import reduce
 
 def allocate_buffers(engine, context):
     input_name = engine.get_tensor_name(0)
@@ -209,72 +235,99 @@ def allocate_buffers(engine, context):
 
 
 def infer(capt_img_q, inf_result_q):
-    global fps
-    global ENGINE_PATH
-    global abort_flag
+    global g_fps
+    global g_engine_path
+    global g_abort_flag
 
     runtime = trt.Runtime(TRT_LOGGER)
-    with open(ENGINE_PATH, 'rb') as f:
-        engine = runtime.deserialize_cuda_engine(f.read())
-    context = engine.create_execution_context()
 
-    h_input, h_output, d_input, d_output, input_shape = allocate_buffers(engine, context)
+    engines = []
+    for engine_path in ENGINE_PATHS:
+        with open(engine_path, 'rb') as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        context = engine.create_execution_context()
+        buffers = [ allocate_buffers(engine, context) for _ in range(2) ]
+        engines.append((engine, engine_path, context, buffers))
 
-    stream = cuda.Stream()
+    streams = [ cuda.Stream() for _ in range(2) ]
 
     tensor = None
     num_infer = 0
-    fps = 0
-
-    num_batch = input_shape[0]
-    print(f'Model: {ENGINE_PATH}, Batch: {num_batch}')
-    cnt_batch = 0
-    tensor_buf = np.empty((num_batch, 3, 640, 640), dtype=np.float32)
-    img_buf = []
+    g_fps = 0
 
     img = np.empty((640,630,3), dtype=np.uint8)
     pred = np.zeros((84, 8400), dtype=np.float32)
 
-    stime = time.perf_counter()
-    while abort_flag == False:
-        if capt_img_q.qsize() > 0:
-            img, tensor = capt_img_q.get()
-        if tensor is None:
-            continue
+    session_start_time = time.time()
 
-        tensor_buf[cnt_batch,:,:,:] = tensor
-        img_buf.append(img)
 
-        cnt_batch += 1
-        if cnt_batch < num_batch:
-            continue
+    while True:
+        for engine, engine_path, context, buffers in engines:
+            g_engine_path = engine_path
+            input_shape = buffers[0][4]
+            num_batch = input_shape[0]
+            print(f'Model: {engine_path}')
+            cnt_batch = 0
+            tensor_batch = np.empty((num_batch, 3, 640, 640), dtype=np.float32)
+            image_batch = [[],[]]
 
-        cnt_batch = 0
-        h_input = np.ascontiguousarray(tensor_buf)
+            stream_idx = 0
+            prev_stream_idx = -1
 
-        cuda.memcpy_htod_async(d_input, h_input, stream)
-        context.execute_async_v3(stream.handle)
-        cuda.memcpy_dtoh_async(h_output, d_output, stream)
-        stream.synchronize()
+            stime = time.perf_counter()
+            while True:
+                (h_input, h_output, d_input, d_output, input_shape) = buffers[stream_idx]
+                if g_abort_flag:
+                    return
+                if capt_img_q.qsize() > 0:
+                    img, tensor = capt_img_q.get()
+                if tensor is None:
+                    continue
 
-        num_infer += 1
-        if num_infer == 10:
-            etime = time.perf_counter()            
-            num_infer = 0
-            fps = 1.0 / ((etime-stime)/10)
-            fps *= num_batch
-            stime = etime
+                tensor_batch[cnt_batch,:,:,:] = tensor
+                image_batch[stream_idx].append(img)
 
-        for b in range(num_batch):
-            img = img_buf[b]
-            pred = h_output[b]
-            assert inf_result_q.qsize() < num_batch*2, inf_result_q.qsize()
-            inf_result_q.put((pred, img))
-        img_buf = []
+                cnt_batch += 1
+                if cnt_batch < num_batch:
+                    continue
+                cnt_batch = 0
+                h_input = np.ascontiguousarray(tensor_batch)
+
+                cuda.memcpy_htod_async(d_input, h_input, streams[stream_idx])
+                context.execute_async_v3(streams[stream_idx].handle)
+                cuda.memcpy_dtoh_async(h_output, d_output, streams[stream_idx])
+
+                num_infer += 1
+                if num_infer == 10:
+                    etime = time.perf_counter()            
+                    g_fps = 1.0 / ((etime-stime)/10)
+                    g_fps *= num_batch
+                    stime = etime
+                    num_infer = 0
+
+                if prev_stream_idx != -1:
+                    streams[prev_stream_idx].synchronize()
+                    h_output = buffers[prev_stream_idx][1]
+
+                    # disassemble batch result
+                    assert h_output.shape[0] == len(image_batch[prev_stream_idx])
+                    for b in range(len(image_batch[prev_stream_idx])):
+                        img = image_batch[prev_stream_idx][b]
+                        pred = h_output[b]
+                        inf_result_q.put((pred, img))
+                        assert inf_result_q.qsize() < 100, inf_result_q.qsize()
+                    image_batch[prev_stream_idx] = []
+                prev_stream_idx = stream_idx
+                stream_idx = 0 if stream_idx == 1 else 1
+
+                current_time = time.time()
+                if current_time - session_start_time > 10:
+                    session_start_time = current_time
+                    break
 
 
 def main():
-    global abort_flag
+    global g_abort_flag
 
     capt_img_q = queue.Queue()
     inf_result_q = queue.Queue()
@@ -291,7 +344,7 @@ def main():
     # Inference code can't be thread-tize.
     infer(capt_img_q, inf_result_q)
 
-    abort_flag = True
+    g_abort_flag = True
     capt_th.join()
     postprocess_th.join()
     render_th.join()
