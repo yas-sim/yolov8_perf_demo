@@ -47,8 +47,7 @@ def capt():
             cap = None
             continue
         img = cv2.resize(img, (640, 640))
-        tensor = cv2.resize(img, (640, 640))
-        tensor = cv2.cvtColor(tensor, cv2.COLOR_BGR2RGB)
+        tensor = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         capt_img_q.put((img, tensor))
     cap.release()
 
