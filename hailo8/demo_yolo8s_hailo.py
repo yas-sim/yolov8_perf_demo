@@ -19,6 +19,7 @@ from hailo_platform import (
     OutputVStreamParams,
     OutputVStreams,
     VDevice,
+    Device
 )
 
 MODEL_PATH = './yolov8s.hef'
@@ -65,7 +66,10 @@ def infer():
     global abort_flag
     global capt_img_q
     global MODEL_PATH
+    hailo8_devices = Device.scan()
+    print(f'{len(hailo8_devices)} Hailo8 devices are found. {hailo8_devices}')
     params = VDevice.create_params()
+    params.device_ids = hailo8_devices
     params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
 
     # The vdevice is used as a context manager ("with" statement) to ensure it's released on time.
