@@ -49,6 +49,8 @@ def capt():
             continue
         img = cv2.resize(img, (640, 640))
         tensor = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        while capt_img_q.qsize() > 10:  # avoid excessive queue size growth
+            time.sleep(5e-3)
         capt_img_q.put((img, tensor))
     cap.release()
 
@@ -158,8 +160,9 @@ def postprocess():
         text = f'NPU {fps:.2f} FPS'
         put_text_with_fringe(rendered_img, text, (0,0), (0,255,0), 4, 6)
         put_text_with_fringe(rendered_img, MODEL_PATH, (0,600), (0,255,0), 2, 4)
+
         curr_time = time.perf_counter()
-        if curr_time - last_submission_time > 1/30:
+        if curr_time - last_submission_time > 1/30: # Submit the result at a 1/30 sec rate to show it on the screen
             last_submission_time = curr_time
             render_img_q.put(rendered_img)
 
